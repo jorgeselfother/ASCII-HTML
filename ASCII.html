@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="es">
+<meta charset="utf-8" />
+<title>ASCII Video en el navegador — comparativa + descarga</title>
+<style>
+  :root{--bg:#000;--fg:#0f0;--ui:#ddd}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:12px/1 "Courier New",monospace;min-height:100vh;display:flex;flex-direction:column;gap:12px}
+  header{position:sticky;top:0;background:linear-gradient(#000a,#000a);backdrop-filter:saturate(1.2) blur(4px);padding:10px;border-bottom:1px solid #111}
+  .controls{display:flex;flex-wrap:wrap;gap:10px;align-items:center;color:var(--ui);font:12px system-ui,Segoe UI,Roboto,Arial}
+  .controls label{display:flex;gap:6px;align-items:center}
+  .controls button{background:#111;color:#eee;border:1px solid #333;border-radius:8px;padding:8px 12px;cursor:pointer}
+  .controls button[disabled]{opacity:.5;cursor:not-allowed}
+  .controls input[type="range"]{width:180px}
+  .stage{flex:1;display:grid;grid-template-columns:1fr 1fr;gap:10px;padding:10px;min-height:0}
+  .pane{position:relative;border:1px solid #111;border-radius:10px;overflow:hidden;background:#000;display:grid;place-items:center}
+  .pane h3{position:absolute;top:6px;left:8px;margin:0;font:12px/1 system-ui;color:#aaa;background:#000c;padding:4px 6px;border-radius:6px}
+  video,canvas{max-width:100%;max-height:calc(100vh - 140px);object-fit:contain;image-rendering:pixelated}
+  #asciiCanvas{background:#000}
+  footer{color:#777;font:11px system-ui;padding:0 12px 12px}
+</style>
+
+<header>
+  <div class="controls">
+    <label>Vídeos <input id="files" type="file" accept="video/*" multiple></label>
+    <button id="clearSelection" disabled>Borrar selección</button>
+    <button id="play" disabled>Play ▶︎</button>
+    <button id="pause" disabled>Pausa ❚❚</button>
+    <label>Columnas <input id="cols" type="range" min="60" max="200" value="100"></label>
+    <label>Brillo <input id="brightness" type="range" min="0" max="2" step="0.1" value="1"></label>
+    <label><input type="checkbox" id="invert"> Invertir brillo</label>
+    <span id="meta"></span>
+    <button id="processAll" disabled>Procesar y descargar</button>
+  </div>
+  <ul id="fileList"></ul>
+  <div id="progressContainer" style="display: none;">
+    <progress id="progressBar" value="0" max="100"></progress>
+    <span id="progressText">0%</span>
+  </div>
+</header>
+
+<main class="stage">
+  <section class="pane">
+    <h3>Original</h3>
+    <video id="vid" playsinline muted></video>
+  </section>
+  <section class="pane">
+    <h3>Procesado (ASCII)</h3>
+    <canvas id="asciiCanvas"></canvas>
+  </section>
+</main>
+
+<canvas id="sample" style="display:none"></canvas>
+
+<footer>
+  Mantengo el **formato original**: el lienzo ASCII se crea con el mismo ancho y alto que el vídeo de entrada. El deslizador de columnas solo modifica el tamaño de celda / densidad de caracteres.
+</footer>
+
+<script>
+(() => {
+  const filesInput = document.getElementById('files');
+  const clearSelectionBtn = document.getElementById('clearSelection');
+  const playBtn = document.getElementById('play');
+  const pauseBtn = document.getElementById('pause');
+  const processAllBtn = document.getElementById('processAll');
+  const colsSlider = document.getElementById('cols');
+  const brightnessSlider = document.getElementById('brightness');
+  const meta = document.getElementById('meta');
+  const fileList = document.getElementById('fileList');
+  const progressContainer = document.getElementById('progressContainer');
+  const progressBar = document.getElementById('progressBar');
+  const progressText = document.getElementById('progressText');
+  const invertChk = document.getElementById('invert');
+
+  const vid = document.getElementById('vid');
+  const out = document.getElementById('asciiCanvas');
+  const outCtx = out.getContext('2d');
+  const sample = document.getElementById('sample');
+  const sctx = sample.getContext('2d', { willReadFrequently: true });
+
+  // Conjunto de caracteres de oscuro→claro
+  const charset = " .,:;i1tfLC08@#";
+  function charFor(v){ // v en [0,1]
+    const idx = Math.min(charset.length - 1, (v * charset.length) | 0);
+    return charset[idx];
+  }
+
+  let rafId = 0, recording = false, mediaRecorder = null, chunks = [];
+  let cellW = 8, cellH = 14, fontSize = 14, cols = 160, rows = 90;
+  let fileQueue = [];
+
+  function setupCanvasFromVideo(){
+    const W = vid.videoWidth, H = vid.videoHeight;
+    if(!W || !H) return;
+    // El canvas de salida tiene EXACTAMENTE el mismo tamaño que el vídeo
+    out.width = W; out.height = H;
+    // Calcular columnas/filas a partir del slider y de la métrica de fuente
+    cols = +colsSlider.value;
+    // Estimación de relación ancho/alto de caracter para Courier
+    const aspect = 0.55; // ancho relativo por punto de tamaño
+    // Dado el ancho en px del vídeo y las columnas deseadas, obtenemos el tamaño de fuente
+    cellW = W / cols; // px por celda
+    fontSize = Math.max(8, cellW / aspect);
+    // Altura de celda aproximada (línea)
+    cellH = Math.floor(fontSize * 1.15);
+    rows = Math.max(1, Math.floor(H / cellH));
+
+    // Canvas de muestreo: usamos resolución de rejilla (cols x rows)
+    sample.width = cols;
+    sample.height = rows;
+
+    // Tipografía
+    outCtx.font = `${fontSize}px "Courier New", monospace`;
+    outCtx.textBaseline = 'top';
+    outCtx.fillStyle = '#fff'; // Change ASCII character color to white
+    outCtx.imageSmoothingEnabled = false;
+
+    meta.textContent = ` ${W}×${H}px · ${cols}×${rows} chars`;
+  }
+
+  function stopStream(){ if(vid.srcObject) vid.srcObject.getTracks().forEach(t=>t.stop()); }
+
+  filesInput.addEventListener('change', () => {
+    const newFiles = Array.from(filesInput.files);
+    fileQueue = [...fileQueue, ...newFiles]; // Add new files to the existing queue
+    updateFileList();
+  });
+
+  clearSelectionBtn.addEventListener('click', () => {
+    fileQueue = []; // Clear the file queue
+    updateFileList();
+  });
+
+  function updateFileList() {
+    fileList.innerHTML = '';
+    fileQueue.forEach((file, index) => {
+      const li = document.createElement('li');
+      li.textContent = `${index + 1}. ${file.name}`;
+      const removeBtn = document.createElement('button');
+      removeBtn.textContent = '✖';
+      removeBtn.style.marginLeft = '10px';
+      removeBtn.addEventListener('click', () => {
+        fileQueue.splice(index, 1); // Remove the file from the queue
+        updateFileList();
+      });
+      li.appendChild(removeBtn);
+      fileList.appendChild(li);
+    });
+    clearSelectionBtn.disabled = fileQueue.length === 0;
+    processAllBtn.disabled = fileQueue.length === 0;
+    if (fileQueue.length > 0) {
+      const firstFile = fileQueue[0];
+      const url = URL.createObjectURL(firstFile);
+      vid.src = url;
+      vid.load();
+    }
+  }
+
+  vid.addEventListener('loadedmetadata', () => {
+    setupCanvasFromVideo();
+    playBtn.disabled = false; pauseBtn.disabled = false;
+  });
+
+  colsSlider.addEventListener('input', () => {
+    setupCanvasFromVideo();
+  });
+
+  function renderOnce(){
+    if(vid.readyState < 2) return;
+
+    const W = out.width, H = out.height;
+    // 1) Muestrea el fotograma a rejilla cols×rows
+    sctx.drawImage(vid, 0, 0, cols, rows);
+    const { data } = sctx.getImageData(0, 0, cols, rows);
+
+    // 2) Dibuja ASCII en el canvas de salida respetando tamaño original
+    outCtx.clearRect(0,0,W,H);
+    const brightness = +brightnessSlider.value; // Get brightness adjustment value
+    const invert = invertChk.checked;          // Check if inversion is enabled
+
+    for(let y=0; y<rows; y++){
+      const off = y * cols * 4;
+      for(let x=0; x<cols; x++){
+        const i = off + x*4;
+        let r = data[i], g = data[i+1], b = data[i+2];
+        // Apply brightness adjustment
+        r = Math.min(255, r * brightness);
+        g = Math.min(255, g * brightness);
+        b = Math.min(255, b * brightness);
+        const Y = (0.2126*r + 0.7152*g + 0.0722*b) / 255; // luminancia 709
+        const v = invert ? (1 - Y) : Y;                  // Apply inversion if enabled
+        const ch = charFor(v);
+        // posiciona texto en su celda
+        outCtx.fillText(ch, Math.floor(x*cellW), Math.floor(y*cellH));
+      }
+    }
+  }
+
+  function loop(){
+    renderOnce();
+    if('requestVideoFrameCallback' in HTMLVideoElement.prototype){
+      vid.requestVideoFrameCallback(loop);
+    } else {
+      rafId = requestAnimationFrame(loop);
+    }
+  }
+
+  function startRecording(){
+    if(recording) return;
+    chunks = [];
+    const fps = (vid.getVideoPlaybackQuality && vid.getVideoPlaybackQuality().totalVideoFrames) ? undefined : 30;
+    const stream = out.captureStream(fps || 30);
+    mediaRecorder = new MediaRecorder(stream, { mimeType: 'video/webm;codecs=vp9' });
+    mediaRecorder.ondataavailable = e => { if(e.data.size>0) chunks.push(e.data); };
+    mediaRecorder.onstop = () => {
+      const blob = new Blob(chunks, { type: 'video/webm' });
+      const url = URL.createObjectURL(blob);
+      downloadBtn.href = url;
+      downloadBtn.download = 'ascii_video.webm';
+      downloadBtn.disabled = false;
+    };
+    mediaRecorder.start();
+    recording = true;
+  }
+
+  function stopRecording(){
+    if(mediaRecorder && recording){ mediaRecorder.stop(); recording = false; }
+  }
+
+  playBtn.addEventListener('click', async () => {
+    await vid.play();
+    setupCanvasFromVideo();
+    startRecording();
+    loop();
+  });
+
+  pauseBtn.addEventListener('click', () => {
+    vid.pause();
+    if(rafId) cancelAnimationFrame(rafId);
+    stopRecording();
+  });
+
+  vid.addEventListener('ended', () => { stopRecording(); });
+
+  processAllBtn.addEventListener('click', async () => {
+    if (fileQueue.length === 0) return;
+
+    const dirHandle = await window.showDirectoryPicker();
+    progressContainer.style.display = 'block';
+    progressBar.value = 0;
+    progressText.textContent = '0%';
+
+    for (let i = 0; i < fileQueue.length; i++) {
+      const file = fileQueue[i];
+      const url = URL.createObjectURL(file);
+      vid.src = url;
+      await vid.load();
+      setupCanvasFromVideo();
+
+      const chunks = [];
+      const stream = out.captureStream(30);
+      const mediaRecorder = new MediaRecorder(stream, { mimeType: 'video/mp4;codecs=avc1' });
+
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data.size > 0) chunks.push(e.data);
+      };
+
+      mediaRecorder.onstop = async () => {
+        const blob = new Blob(chunks, { type: 'video/mp4' });
+        const fileHandle = await dirHandle.getFileHandle(`${file.name.replace(/\.[^/.]+$/, '')}_ascii.mp4`, { create: true });
+        const writable = await fileHandle.createWritable();
+        await writable.write(blob);
+        await writable.close();
+      };
+
+      mediaRecorder.start();
+      await vid.play();
+      await new Promise((resolve) => {
+        vid.onended = () => {
+          mediaRecorder.stop();
+          resolve();
+        };
+      });
+
+      // Update progress bar
+      const progress = Math.round(((i + 1) / fileQueue.length) * 100);
+      progressBar.value = progress;
+      progressText.textContent = `${progress}%`;
+    }
+
+    alert('Todos los vídeos han sido procesados y guardados.');
+    progressContainer.style.display = 'none';
+  });
+})();
+</script>
+</html>
